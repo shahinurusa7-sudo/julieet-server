@@ -1,0 +1,1364 @@
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const admin = require('firebase-admin');
+const mongoose = require('mongoose');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const bodyParser = require('body-parser');
+const rateLimit = require('express-rate-limit');
+const PendingMessage = require('./models/PendingMessage');
+const packageJson = require('./package.json');
+
+// Initialize Express App
+const app = express();
+const PORT = process.env.PORT || 3002;
+
+// Middleware
+// Disable helmet's crossOriginResourcePolicy so Socket.IO polling works.
+// Default 'same-origin' policy blocks Flutter/mobile clients from reading
+// the /socket.io/... polling responses.
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+  crossOriginOpenerPolicy: false,
+}));
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
+  credentials: true
+}));
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(morgan('combined')); // Logging
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.'
+});
+app.use('/api/', limiter);
+
+// Initialize Firebase Admin SDK
+let serviceAccount;
+try {
+  const configuredFileName =
+    process.env.FIREBASE_SERVICE_ACCOUNT_FILE ||
+    packageJson.config?.firebaseServiceAccountFile ||
+    'serviceAccountKey.json';
+
+  const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH
+    ? path.resolve(__dirname, process.env.FIREBASE_SERVICE_ACCOUNT_PATH)
+    : path.resolve(__dirname, configuredFileName);
+
+  const useJsonEnv =
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON &&
+    process.env.FIREBASE_SERVICE_ACCOUNT_SOURCE === 'env';
+
+  // Prefer file-based credentials by default to avoid accidental stale env vars.
+  if (!useJsonEnv && fs.existsSync(serviceAccountPath)) {
+    serviceAccount = require(serviceAccountPath);
+    console.log(`🔐 Firebase credentials source: file (${serviceAccountPath})`);
+  } else if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    console.log('🔐 Firebase credentials source: FIREBASE_SERVICE_ACCOUNT_JSON');
+  } else {
+    throw new Error(
+      `Firebase service account not found. Checked file: ${serviceAccountPath}`
+    );
+  }
+
+  // Normalize escaped newlines in private key if loaded from env JSON.
+  if (typeof serviceAccount.private_key === 'string') {
+    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+  }
+
+  if (!serviceAccount.project_id || !serviceAccount.client_email || !serviceAccount.private_key) {
+    throw new Error('Invalid Firebase service account JSON content');
+  }
+
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    projectId: serviceAccount.project_id,
+    databaseURL: process.env.FIREBASE_DATABASE_URL,
+    storageBucket: process.env.FIREBASE_STORAGE_BUCKET
+  });
+
+  console.log('✅ Firebase Admin SDK initialized successfully');
+} catch (error) {
+  console.error('❌ Error initializing Firebase Admin SDK:', error.message);
+  process.exit(1);
+}
+
+// Firebase services
+const db = admin.firestore();
+const realtimeDb = admin.database();
+const auth = admin.auth();
+const storage = admin.storage();
+
+const safeDecodeURIComponent = (value) => {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+};
+
+const maskMongoUri = (uri) => uri.replace(/(mongodb(?:\+srv)?:\/\/[^:]+:)([^@]+)(@.*)/, '$1***$3');
+
+const MESSAGE_ENCRYPTION_ALGO = 'aes-256-gcm';
+const MESSAGE_ENCRYPTION_VERSION = 'v1';
+
+const getMessageEncryptionKey = () => {
+  const rawKey =
+    process.env.OFFLINE_MSG_ENCRYPTION_KEY ||
+    process.env.MESSAGE_ENCRYPTION_KEY ||
+    process.env.JWT_SECRET;
+
+  if (!rawKey) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'Missing encryption key. Set OFFLINE_MSG_ENCRYPTION_KEY (or MESSAGE_ENCRYPTION_KEY/JWT_SECRET).'
+      );
+    }
+
+    console.warn(
+      '⚠️  Using development fallback message encryption key. Set OFFLINE_MSG_ENCRYPTION_KEY for secure environments.'
+    );
+    return crypto.createHash('sha256').update('julieet-dev-offline-message-key').digest();
+  }
+
+  return crypto.createHash('sha256').update(String(rawKey)).digest();
+};
+
+const encryptMessageContent = (plainText) => {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv(MESSAGE_ENCRYPTION_ALGO, getMessageEncryptionKey(), iv);
+  const encrypted = Buffer.concat([
+    cipher.update(String(plainText || ''), 'utf8'),
+    cipher.final(),
+  ]);
+
+  return {
+    content: encrypted.toString('base64'),
+    enc: {
+      v: MESSAGE_ENCRYPTION_VERSION,
+      alg: MESSAGE_ENCRYPTION_ALGO,
+      iv: iv.toString('base64'),
+      tag: cipher.getAuthTag().toString('base64'),
+    }
+  };
+};
+
+const decryptMessageContent = (encryptedContent, metadata) => {
+  const enc = metadata?.enc;
+
+  if (
+    !enc ||
+    enc.alg !== MESSAGE_ENCRYPTION_ALGO ||
+    !enc.iv ||
+    !enc.tag ||
+    !encryptedContent
+  ) {
+    return encryptedContent || '';
+  }
+
+  try {
+    const decipher = crypto.createDecipheriv(
+      MESSAGE_ENCRYPTION_ALGO,
+      getMessageEncryptionKey(),
+      Buffer.from(enc.iv, 'base64')
+    );
+    decipher.setAuthTag(Buffer.from(enc.tag, 'base64'));
+
+    const decrypted = Buffer.concat([
+      decipher.update(Buffer.from(encryptedContent, 'base64')),
+      decipher.final(),
+    ]);
+
+    return decrypted.toString('utf8');
+  } catch (error) {
+    console.warn('Warning: failed to decrypt pending message content:', error.message);
+    return '';
+  }
+};
+
+const serializePendingMessageForClient = (msg) => ({
+  messageId: msg.messageId,
+  senderId: msg.senderId,
+  receiverId: msg.receiverId,
+  chatId: msg.chatId,
+  messageType: msg.messageType,
+  content: decryptMessageContent(msg.content, msg.metadata),
+  mediaUrl: msg.mediaUrl,
+  thumbnailUrl: msg.thumbnailUrl,
+  createdAt: msg.createdAt,
+  metadata: msg.metadata || {}
+});
+
+const normalizeMongoUri = (uri) => {
+  if (!uri) {
+    return uri;
+  }
+
+  const trimmedUri = uri.trim().replace(/^['"]|['"]$/g, '');
+  if (!trimmedUri.startsWith('mongodb://') && !trimmedUri.startsWith('mongodb+srv://')) {
+    return trimmedUri;
+  }
+
+  const protocolSeparatorIndex = trimmedUri.indexOf('://');
+  const lastAtIndex = trimmedUri.lastIndexOf('@');
+
+  if (protocolSeparatorIndex === -1 || lastAtIndex === -1) {
+    return trimmedUri;
+  }
+
+  const credentialsAndHost = trimmedUri.slice(protocolSeparatorIndex + 3);
+  const credentialsPart = credentialsAndHost.slice(0, credentialsAndHost.lastIndexOf('@'));
+  const hostAndQuery = credentialsAndHost.slice(credentialsAndHost.lastIndexOf('@') + 1);
+  const firstColonIndex = credentialsPart.indexOf(':');
+
+  if (firstColonIndex === -1) {
+    return trimmedUri;
+  }
+
+  const username = credentialsPart.slice(0, firstColonIndex);
+  const rawPassword = credentialsPart.slice(firstColonIndex + 1);
+  const encodedPassword = encodeURIComponent(safeDecodeURIComponent(rawPassword));
+  const prefix = trimmedUri.slice(0, protocolSeparatorIndex + 3);
+
+  return `${prefix}${username}:${encodedPassword}@${hostAndQuery}`;
+};
+
+// Initialize MongoDB connection
+const connectMongoDB = async () => {
+  try {
+    const configuredMongoUri = process.env.MONGODB_URI || 'mongodb+srv://doadmin:8R67T5uh2V9M13dj@dbaas-db-8716287-669712ac.mongo.ondigitalocean.com/admin?tls=true&authSource=admin&replicaSet=dbaas-db-8716287';
+    const mongoUri = normalizeMongoUri(configuredMongoUri);
+
+    await mongoose.connect(mongoUri, {
+      serverSelectionTimeoutMS: 15000
+    });
+    console.log('✅ MongoDB connected successfully');
+    console.log(`📦 Temporary SMS/message storage active in MongoDB: ${maskMongoUri(mongoUri)}`);
+
+    // Setup automatic cleanup of old delivered messages (runs daily)
+    setInterval(async () => {
+      try {
+        const result = await PendingMessage.cleanupOldMessages(7);
+        console.log(`🧹 Cleaned up ${result.deletedCount} old messages`);
+      } catch (error) {
+        console.error('Error cleaning up old messages:', error);
+      }
+    }, 24 * 60 * 60 * 1000); // Run every 24 hours
+
+  } catch (error) {
+    console.error('❌ MongoDB connection error:', error.message);
+    console.warn('⚠️  Server running without MongoDB. Message queue features disabled.');
+  }
+};
+
+connectMongoDB();
+
+// Middleware to verify Firebase token
+const verifyToken = async (req, res, next) => {
+  try {
+    const token = req.headers.authorization?.split('Bearer ')[1];
+
+    if (!token) {
+      console.log('❌ No authorization token provided');
+      return res.status(401).json({ error: 'No token provided', message: 'Authorization header missing' });
+    }
+
+    console.log('🔐 Verifying Firebase ID token...');
+    const decodedToken = await auth.verifyIdToken(token);
+    console.log(`✅ Token verified for user: ${decodedToken.uid} (${decodedToken.email})`);
+    
+    req.user = decodedToken;
+    next();
+  } catch (error) {
+    console.error('❌ Token verification failed:', error.message);
+    console.error('   Error code:', error.code);
+    return res.status(403).json({ 
+      error: 'Invalid or expired token',
+      message: `Token verification failed: ${error.message}`,
+      code: error.code
+    });
+  }
+};
+
+// ==================== ROUTES ====================
+
+// Health check
+app.get('/', (req, res) => {
+  res.json({
+    status: 'running',
+    message: 'Love Birds Server API',
+    version: '1.0.0',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ==================== WEB APP VERIFICATION ====================
+
+/**
+ * Verify if user account exists in Firestore
+ * Used by web app to check if Google-signed user has created account via mobile
+ */
+app.get('/api/verify-account', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const email = req.user.email;
+
+    console.log(`\n🔍 ===== ACCOUNT VERIFICATION REQUEST =====`);
+    console.log(`   User ID (UID): ${userId}`);
+    console.log(`   Email: ${email}`);
+    console.log(`   Looking in Firestore: users/${userId}`);
+
+    // Check if user exists in Firestore
+    const userDoc = await db.collection('users').doc(userId).get();
+
+    console.log(`   Document exists: ${userDoc.exists}`);
+
+    if (!userDoc.exists) {
+      console.log(`❌ Account not found for user: ${userId}`);
+      console.log(`   Tip: Check if document exists at: Firestore > users > ${userId}`);
+      console.log(`========================================\n`);
+      return res.json({
+        exists: false,
+        message: `Account not found. Please create an account using the mobile app.\n\nUser ID: ${userId}\nEmail: ${email}`
+      });
+    }
+
+    const userData = userDoc.data();
+    console.log(`   User data found:`, JSON.stringify(userData, null, 2));
+
+    // Verify email matches (optional additional check)
+    if (userData.email && userData.email !== email) {
+      console.log(`⚠️  Email mismatch for user: ${userId}`);
+      console.log(`   Firestore email: ${userData.email}`);
+      console.log(`   Google email: ${email}`);
+      console.log(`========================================\n`);
+      return res.json({
+        exists: false,
+        message: `Email mismatch.\n\nFirestore: ${userData.email}\nGoogle: ${email}\n\nPlease use the correct Google account.`
+      });
+    }
+
+    console.log(`✅ Account verified successfully for user: ${userId}`);
+    console.log(`========================================\n`);
+    
+    res.json({
+      exists: true,
+      user: {
+        id: userId,
+        email: email,
+        name: userData.name || userData.displayName,
+        photoURL: userData.photoURL,
+        gender: userData.gender,
+        createdAt: userData.createdAt
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error verifying account:', error);
+    console.error('   Error details:', error.message);
+    console.error('   Stack trace:', error.stack);
+    console.log(`========================================\n`);
+    res.status(500).json({
+      exists: false,
+      error: 'Internal server error',
+      message: `Failed to verify account: ${error.message}`
+    });
+  }
+});
+
+// ==================== USER ROUTES ====================
+
+// Get user profile
+app.get('/api/users/:userId', verifyToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    // Get user from Firestore
+    const userDoc = await db.collection('users').doc(userId).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        id: userDoc.id,
+        ...userDoc.data()
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching user:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update user profile
+app.put('/api/users/:userId', verifyToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const updates = req.body;
+
+    // Verify user is updating their own profile
+    if (req.user.uid !== userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    // Update Firestore
+    await db.collection('users').doc(userId).update({
+      ...updates,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({
+      success: true,
+      message: 'User profile updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating user:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== NOTIFICATION ROUTES ====================
+
+// Send push notification
+app.post('/api/notifications/send', verifyToken, async (req, res) => {
+  try {
+    const { token, title, body, data } = req.body;
+
+    if (!token || !title || !body) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const message = {
+      notification: {
+        title,
+        body
+      },
+      data: data || {},
+      token
+    };
+
+    const response = await admin.messaging().send(message);
+
+    res.json({
+      success: true,
+      messageId: response
+    });
+  } catch (error) {
+    console.error('Error sending notification:', error);
+    res.status(500).json({ error: 'Failed to send notification' });
+  }
+});
+
+// ==================== CHAT ROUTES ====================
+
+// Create or get chat
+app.post('/api/chats/create', verifyToken, async (req, res) => {
+  try {
+    const { participantIds } = req.body;
+
+    if (!participantIds || participantIds.length !== 2) {
+      return res.status(400).json({ error: 'Invalid participants' });
+    }
+
+    // Check if chat already exists
+    const existingChat = await db.collection('chats')
+      .where('participants', 'array-contains', req.user.uid)
+      .get();
+
+    let chatId = null;
+    existingChat.forEach(doc => {
+      const data = doc.data();
+      if (data.participants.includes(participantIds[1])) {
+        chatId = doc.id;
+      }
+    });
+
+    // Create new chat if doesn't exist
+    if (!chatId) {
+      const chatRef = await db.collection('chats').add({
+        participants: participantIds,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastMessage: {
+          text: '',
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          senderId: ''
+        }
+      });
+      chatId = chatRef.id;
+    }
+
+    res.json({
+      success: true,
+      chatId
+    });
+  } catch (error) {
+    console.error('Error creating chat:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== MESSAGE QUEUE ROUTES ====================
+
+// Send message (stores in MongoDB if receiver is offline)
+app.post('/api/messages/send', verifyToken, async (req, res) => {
+  try {
+    const { receiverId, chatId, messageType, content, mediaUrl, thumbnailUrl, metadata } = req.body;
+
+    if (!receiverId || !chatId || !content) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Generate unique message ID
+    const messageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Check if receiver is online (you can implement your own online status logic)
+    // For now, we'll always store in MongoDB first
+
+    try {
+      const encryptedPayload = encryptMessageContent(content);
+
+      // Store message in MongoDB
+      const pendingMessage = new PendingMessage({
+        messageId,
+        senderId: req.user.uid,
+        receiverId,
+        chatId,
+        messageType: messageType || 'text',
+        content: encryptedPayload.content,
+        mediaUrl,
+        thumbnailUrl,
+        status: 'pending',
+        metadata: {
+          ...(metadata || {}),
+          enc: encryptedPayload.enc,
+        }
+      });
+
+      await pendingMessage.save();
+
+      // Also try to send push notification
+      try {
+        const receiverDoc = await db.collection('users').doc(receiverId).get();
+        if (receiverDoc.exists) {
+          const receiverData = receiverDoc.data();
+          if (receiverData.fcmToken) {
+            await admin.messaging().send({
+              notification: {
+                title: 'New Message',
+                body: messageType === 'text' ? content : `Sent a ${messageType}`
+              },
+              data: {
+                type: 'new_message',
+                chatId,
+                messageId,
+                senderId: req.user.uid
+              },
+              token: receiverData.fcmToken
+            });
+          }
+        }
+      } catch (notifError) {
+        console.warn('Failed to send push notification:', notifError.message);
+      }
+
+      res.json({
+        success: true,
+        messageId,
+        status: 'queued'
+      });
+    } catch (dbError) {
+      console.error('MongoDB error:', dbError);
+      res.status(500).json({ error: 'Failed to queue message' });
+    }
+  } catch (error) {
+    console.error('Error sending message:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get pending messages for current user (when they come online)
+app.get('/api/messages/pending', verifyToken, async (req, res) => {
+  try {
+    const pendingMessages = await PendingMessage.getPendingMessagesForUser(req.user.uid);
+
+    res.json({
+      success: true,
+      count: pendingMessages.length,
+      messages: pendingMessages.map(serializePendingMessageForClient)
+    });
+  } catch (error) {
+    console.error('Error fetching pending messages:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get pending messages for a specific chat
+app.get('/api/messages/pending/:chatId', verifyToken, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    // Verify user is part of the chat
+    const chatDoc = await db.collection('chats').doc(chatId).get();
+    if (!chatDoc.exists) {
+      return res.status(404).json({ error: 'Chat not found' });
+    }
+
+    const chatData = chatDoc.data();
+    if (!chatData.participants.includes(req.user.uid)) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+
+    const pendingMessages = await PendingMessage.getPendingMessagesByChat(chatId);
+
+    res.json({
+      success: true,
+      count: pendingMessages.length,
+      messages: pendingMessages.map(serializePendingMessageForClient)
+    });
+  } catch (error) {
+    console.error('Error fetching chat messages:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Mark messages as delivered (after saving to local SQLite)
+app.post('/api/messages/delivered', verifyToken, async (req, res) => {
+  try {
+    const { messageIds } = req.body;
+
+    if (!messageIds || !Array.isArray(messageIds) || messageIds.length === 0) {
+      return res.status(400).json({ error: 'Invalid messageIds' });
+    }
+
+    // Mark all messages as delivered
+    const results = await Promise.allSettled(
+      messageIds.map(async (messageId) => {
+        const message = await PendingMessage.findOne({
+          messageId,
+          receiverId: req.user.uid,
+          status: 'pending'
+        });
+
+        if (message) {
+          return await message.markAsDelivered();
+        }
+        return null;
+      })
+    );
+
+    const successCount = results.filter(r => r.status === 'fulfilled' && r.value).length;
+
+    res.json({
+      success: true,
+      delivered: successCount,
+      total: messageIds.length
+    });
+  } catch (error) {
+    console.error('Error marking messages as delivered:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete delivered messages (cleanup after confirmed local storage)
+app.delete('/api/messages/cleanup', verifyToken, async (req, res) => {
+  try {
+    const { messageIds } = req.body;
+
+    if (!messageIds || !Array.isArray(messageIds)) {
+      return res.status(400).json({ error: 'Invalid messageIds' });
+    }
+
+    // Delete only delivered messages for this user
+    const result = await PendingMessage.deleteMany({
+      messageId: { $in: messageIds },
+      receiverId: req.user.uid,
+      status: 'delivered'
+    });
+
+    res.json({
+      success: true,
+      deleted: result.deletedCount
+    });
+  } catch (error) {
+    console.error('Error cleaning up messages:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Check connection status and sync
+app.post('/api/messages/sync', verifyToken, async (req, res) => {
+  try {
+    // Get all pending messages
+    const pendingMessages = await PendingMessage.getPendingMessagesForUser(req.user.uid);
+
+    // Get message counts by chat
+    const chatCounts = {};
+    pendingMessages.forEach(msg => {
+      chatCounts[msg.chatId] = (chatCounts[msg.chatId] || 0) + 1;
+    });
+
+    res.json({
+      success: true,
+      totalPending: pendingMessages.length,
+      chatCounts,
+      messages: pendingMessages.map(serializePendingMessageForClient)
+    });
+  } catch (error) {
+    console.error('Error syncing messages:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get message queue statistics (for debugging/monitoring)
+app.get('/api/messages/stats', verifyToken, async (req, res) => {
+  try {
+    const stats = await PendingMessage.aggregate([
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    const userPendingCount = await PendingMessage.countDocuments({
+      receiverId: req.user.uid,
+      status: 'pending'
+    });
+
+    res.json({
+      success: true,
+      globalStats: stats,
+      userPendingCount
+    });
+  } catch (error) {
+    console.error('Error fetching stats:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== ADMIN ROUTES ====================
+
+// Get all users (admin only)
+app.get('/api/admin/users', verifyToken, async (req, res) => {
+  try {
+    // Check if user is admin
+    const userDoc = await db.collection('users').doc(req.user.uid).get();
+    if (!userDoc.exists || !userDoc.data().isAdmin) {
+      return res.status(403).json({ error: 'Unauthorized - Admin only' });
+    }
+
+    const usersSnapshot = await db.collection('users').limit(100).get();
+    const users = [];
+
+    usersSnapshot.forEach(doc => {
+      users.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    res.json({
+      success: true,
+      data: users,
+      count: users.length
+    });
+  } catch (error) {
+    console.error('Error fetching users:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete user (admin only)
+app.delete('/api/admin/users/:userId', verifyToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    // Check if user is admin
+    const userDoc = await db.collection('users').doc(req.user.uid).get();
+    if (!userDoc.exists || !userDoc.data().isAdmin) {
+      return res.status(403).json({ error: 'Unauthorized - Admin only' });
+    }
+
+    // Delete from Firebase Auth
+    await auth.deleteUser(userId);
+
+    // Delete from Firestore
+    await db.collection('users').doc(userId).delete();
+
+    res.json({
+      success: true,
+      message: 'User deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting user:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== STORAGE ROUTES ====================
+
+// Generate signed URL for file upload
+app.post('/api/storage/upload-url', verifyToken, async (req, res) => {
+  try {
+    const { fileName, contentType } = req.body;
+
+    if (!fileName || !contentType) {
+      return res.status(400).json({ error: 'Missing fileName or contentType' });
+    }
+
+    const bucket = storage.bucket();
+    const file = bucket.file(`uploads/${req.user.uid}/${Date.now()}_${fileName}`);
+
+    const [url] = await file.getSignedUrl({
+      version: 'v4',
+      action: 'write',
+      expires: Date.now() + 15 * 60 * 1000, // 15 minutes
+      contentType
+    });
+
+    res.json({
+      success: true,
+      uploadUrl: url,
+      filePath: file.name
+    });
+  } catch (error) {
+    console.error('Error generating upload URL:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== ANALYTICS ROUTES ====================
+
+// Log analytics event
+app.post('/api/analytics/log', verifyToken, async (req, res) => {
+  try {
+    const { event, properties } = req.body;
+
+    await db.collection('analytics').add({
+      userId: req.user.uid,
+      event,
+      properties: properties || {},
+      timestamp: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({
+      success: true,
+      message: 'Event logged successfully'
+    });
+  } catch (error) {
+    console.error('Error logging analytics:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== ERROR HANDLING ====================
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Not Found',
+    message: 'The requested endpoint does not exist'
+  });
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({
+    error: 'Internal Server Error',
+    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
+  });
+});
+
+// ==================== START SERVER ====================
+
+// Wrap Express in an HTTP server so Socket.IO can share the same port
+const httpServer = http.createServer(app);
+
+// ── Socket.IO setup ───────────────────────────────────────────
+const io = new Server(httpServer, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+    credentials: true,
+  },
+  // polling MUST come first — client starts with polling then upgrades
+  transports: ['polling', 'websocket'],
+  pingTimeout: 30000,
+  pingInterval: 10000,
+  upgradeTimeout: 15000,
+  allowEIO3: true, // allow older Engine.IO clients (Flutter)
+});
+
+// Track online users:  userId -> Set<socketId>
+const onlineUsers = new Map();
+
+// Auth middleware – verify Firebase token on every connection
+// Token can come from auth object (preferred) or query string (fallback)
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+    if (!token) return next(new Error('No token provided'));
+    const decoded = await admin.auth().verifyIdToken(token);
+    socket.userId = decoded.uid;
+    socket.userIdFromQuery = socket.handshake.query?.userId || decoded.uid;
+    next();
+  } catch (err) {
+    next(new Error('Invalid or expired token'));
+  }
+});
+
+io.on('connection', (socket) => {
+  const userId = socket.userId;
+  console.log(`✅ [Socket.IO] User connected: ${userId} (${socket.id})`);
+
+  // ── Track presence ──────────────────────────────────────────
+  if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
+  onlineUsers.get(userId).add(socket.id);
+
+  // Join a personal room so we can target this user directly
+  socket.join(userId);
+
+  // Broadcast online status
+  socket.broadcast.emit('presence_update', { userId, status: 'online', lastSeen: null });
+
+  // ── send_message ────────────────────────────────────────────
+  socket.on('send_message', async (data) => {
+    try {
+      const { messageId, chatId, receiverId, content, mediaUrl, messageType, timestamp } = data;
+
+      // Deliver to receiver if online
+      if (onlineUsers.has(receiverId)) {
+        io.to(receiverId).emit('new_message', {
+          messageId,
+          chatId,
+          senderId: userId,
+          receiverId,
+          content,
+          mediaUrl,
+          messageType: messageType || 'text',
+          timestamp: timestamp || Date.now(),
+        });
+        // Notify sender of delivery
+        socket.emit('message_status_update', { messageId, status: 'delivered' });
+        console.log(`📤 [Socket.IO] Message ${messageId} delivered to online user ${receiverId}`);
+      } else {
+        // Receiver is offline – store in MongoDB
+        try {
+          const exists = await PendingMessage.findOne({ messageId });
+          if (!exists) {
+            const encryptedPayload = encryptMessageContent(content);
+
+            await new PendingMessage({
+              messageId,
+              senderId: userId,
+              receiverId,
+              chatId,
+              messageType: messageType || 'text',
+              content: encryptedPayload.content,
+              mediaUrl,
+              status: 'pending',
+              metadata: {
+                enc: encryptedPayload.enc,
+              },
+            }).save();
+          }
+          socket.emit('message_status_update', { messageId, status: 'pending' });
+          console.log(`📦 [Socket.IO] Message ${messageId} queued for offline user ${receiverId}`);
+        } catch (dbErr) {
+          console.error('[Socket.IO] DB error queuing message:', dbErr.message);
+        }
+      }
+    } catch (err) {
+      console.error('[Socket.IO] send_message error:', err);
+    }
+  });
+
+  // ── fetch_pending – deliver queued messages on reconnect ────
+  socket.on('fetch_pending', async (data) => {
+    try {
+      const lastSyncTime = data?.lastSyncTime || 0;
+      const since = new Date(lastSyncTime);
+      const pending = await PendingMessage.find({
+        receiverId: userId,
+        status: 'pending',
+        createdAt: { $gte: since },
+      }).sort({ createdAt: 1 }).limit(100);
+
+      if (pending.length > 0) {
+        socket.emit('pending_messages', pending.map(m => ({
+          messageId: m.messageId,
+          chatId: m.chatId,
+          senderId: m.senderId,
+          content: decryptMessageContent(m.content, m.metadata),
+          mediaUrl: m.mediaUrl,
+          messageType: m.messageType,
+          timestamp: m.createdAt.getTime(),
+        })));
+        console.log(`📬 [Socket.IO] Sent ${pending.length} pending messages to ${userId}`);
+      }
+    } catch (err) {
+      console.error('[Socket.IO] fetch_pending error:', err);
+    }
+  });
+
+  // ── ack – mark message as delivered ────────────────────────
+  socket.on('ack', async (data) => {
+    const { messageId, ackType } = data;
+    if (ackType === 'delivered') {
+      try {
+        await PendingMessage.findOneAndUpdate(
+          { messageId, receiverId: userId },
+          { $set: { status: 'delivered', deliveredAt: new Date() } },
+        );
+      } catch (e) { /* non-critical */ }
+    }
+  });
+
+  // ── typing indicator ────────────────────────────────────────
+  socket.on('typing', (data) => {
+    const { receiverId, chatId, isTyping } = data;
+    if (receiverId && onlineUsers.has(receiverId)) {
+      io.to(receiverId).emit('typing_status', {
+        senderId: userId,
+        chatId,
+        isTyping: !!isTyping,
+      });
+    }
+  });
+
+  // ── mark_seen ───────────────────────────────────────────────
+  socket.on('mark_seen', (data) => {
+    const { chatId, senderId: originalSender } = data;
+    if (originalSender && onlineUsers.has(originalSender)) {
+      io.to(originalSender).emit('message_seen', { chatId, seenBy: userId });
+    }
+  });
+
+  // ── disconnect ──────────────────────────────────────────────
+  socket.on('disconnect', () => {
+    const sockets = onlineUsers.get(userId);
+    if (sockets) {
+      sockets.delete(socket.id);
+      if (sockets.size === 0) {
+        onlineUsers.delete(userId);
+        socket.broadcast.emit('presence_update', {
+          userId,
+          status: 'offline',
+          lastSeen: Date.now(),
+        });
+      }
+    }
+    
+    // Handle video call disconnection
+    if (videoCallPairs.has(socket.id)) {
+      const partnerId = videoCallPairs.get(socket.id);
+      io.to(partnerId).emit('video_call_ended', { reason: 'partner_disconnected' });
+      videoCallPairs.delete(partnerId);
+      videoCallPairs.delete(socket.id);
+    }
+    
+    // Remove from waiting queues
+    maleQueue.delete(socket.id);
+    femaleQueue.delete(socket.id);
+    
+    console.log(`📴 [Socket.IO] User disconnected: ${userId} (${socket.id})`);
+  });
+});
+
+// ==================== WEBRTC VIDEO MATCHING ====================
+// Track waiting users by gender for opposite-gender matching
+const maleQueue = new Map(); // socketId -> { userId, gender, socketId }
+const femaleQueue = new Map();
+const videoCallPairs = new Map(); // socketId -> partnerId
+
+// STUN server configuration (Google's free STUN servers)
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+  { urls: 'stun:stun4.l.google.com:19302' }
+];
+
+const removeSocketFromVideoQueues = (socketId) => {
+  maleQueue.delete(socketId);
+  femaleQueue.delete(socketId);
+};
+
+const findNextValidPartner = (oppositeQueue, currentSocketId) => {
+  while (oppositeQueue.size > 0) {
+    const [partnerSocketId, partnerInfo] = oppositeQueue.entries().next().value;
+    oppositeQueue.delete(partnerSocketId);
+
+    if (partnerSocketId === currentSocketId) {
+      continue;
+    }
+
+    const partnerSocket = io.sockets.sockets.get(partnerSocketId);
+    if (!partnerSocket || !partnerSocket.connected) {
+      continue;
+    }
+
+    if (videoCallPairs.has(partnerSocketId)) {
+      continue;
+    }
+
+    return { partnerSocketId, partnerInfo, partnerSocket };
+  }
+
+  return null;
+};
+
+const startVideoMatchForSocket = async (socket) => {
+  const userId = socket.userId;
+
+  if (!userId) {
+    socket.emit('video_match_error', { error: 'User not authenticated' });
+    return;
+  }
+
+  // Prevent duplicate queue entries for the same socket.
+  removeSocketFromVideoQueues(socket.id);
+
+  // Fetch user's gender from Firestore using Firebase Admin SDK
+  let gender;
+  try {
+    const userDoc = await db.collection('users').doc(userId).get();
+
+    if (!userDoc.exists) {
+      socket.emit('video_match_error', { error: 'User profile not found' });
+      console.error(`❌ [VideoMatch] User ${userId} not found in Firestore`);
+      return;
+    }
+
+    const userData = userDoc.data();
+    gender = userData.gender?.toLowerCase().trim();
+
+    if (!gender || (gender !== 'male' && gender !== 'female')) {
+      socket.emit('video_match_error', {
+        error: 'Gender not set in profile. Please update your profile.'
+      });
+      console.error(`❌ [VideoMatch] Invalid gender for user ${userId}: ${gender}`);
+      return;
+    }
+
+    console.log(`🎥 [VideoMatch] ${userId} (${gender}) looking for match...`);
+  } catch (dbError) {
+    console.error(`❌ [VideoMatch] Error fetching user profile: ${dbError.message}`);
+    socket.emit('video_match_error', { error: 'Failed to fetch user profile' });
+    return;
+  }
+
+  const userInfo = { userId, gender, socketId: socket.id };
+
+  // Determine which queues to use for matching
+  let myQueue;
+  let oppositeQueue;
+  if (gender === 'male') {
+    myQueue = maleQueue;
+    oppositeQueue = femaleQueue;
+  } else {
+    myQueue = femaleQueue;
+    oppositeQueue = maleQueue;
+  }
+
+  const partner = findNextValidPartner(oppositeQueue, socket.id);
+
+  if (partner) {
+    // Create pair
+    videoCallPairs.set(socket.id, partner.partnerSocketId);
+    videoCallPairs.set(partner.partnerSocketId, socket.id);
+
+    // Send ICE servers and match info to both parties
+    socket.emit('video_match_found', {
+      partnerId: partner.partnerInfo.userId,
+      partnerSocketId: partner.partnerSocketId,
+      iceServers: ICE_SERVERS,
+      isInitiator: true // This user initiates the call
+    });
+
+    io.to(partner.partnerSocketId).emit('video_match_found', {
+      partnerId: userId,
+      partnerSocketId: socket.id,
+      iceServers: ICE_SERVERS,
+      isInitiator: false // This user receives the call
+    });
+
+    console.log(`✅ [VideoMatch] Matched ${userId} with ${partner.partnerInfo.userId}`);
+  } else {
+    // No match available, add to queue
+    myQueue.set(socket.id, userInfo);
+    socket.emit('video_match_waiting', {
+      message: 'Searching for a match...',
+      queuePosition: myQueue.size
+    });
+    console.log(`⏳ [VideoMatch] ${userId} added to ${gender} queue (${myQueue.size} waiting)`);
+  }
+};
+
+io.on('connection', (socket) => {
+  
+  // ── video_match_start: Join queue for random video matching ──
+  socket.on('video_match_start', async () => {
+    try {
+      await startVideoMatchForSocket(socket);
+    } catch (error) {
+      console.error('[VideoMatch] Error in video_match_start:', error);
+      socket.emit('video_match_error', { error: 'Failed to start matching' });
+    }
+  });
+  
+  // ── video_match_cancel: Leave the matching queue ──
+  socket.on('video_match_cancel', () => {
+    const userId = socket.userId;
+    removeSocketFromVideoQueues(socket.id);
+    socket.emit('video_match_cancelled', { message: 'Matching cancelled' });
+    console.log(`❌ [VideoMatch] ${userId} cancelled matching`);
+  });
+  
+  // ── WebRTC signaling: offer ──
+  socket.on('webrtc_offer', (data) => {
+    const { offer, targetSocketId } = data;
+    
+    if (!videoCallPairs.has(socket.id) || videoCallPairs.get(socket.id) !== targetSocketId) {
+      console.error('[WebRTC] Invalid offer - not paired');
+      return;
+    }
+    
+    io.to(targetSocketId).emit('webrtc_offer', {
+      offer,
+      fromSocketId: socket.id
+    });
+    
+    console.log(`📞 [WebRTC] Offer sent from ${socket.id} to ${targetSocketId}`);
+  });
+  
+  // ── WebRTC signaling: answer ──
+  socket.on('webrtc_answer', (data) => {
+    const { answer, targetSocketId } = data;
+    
+    if (!videoCallPairs.has(socket.id) || videoCallPairs.get(socket.id) !== targetSocketId) {
+      console.error('[WebRTC] Invalid answer - not paired');
+      return;
+    }
+    
+    io.to(targetSocketId).emit('webrtc_answer', {
+      answer,
+      fromSocketId: socket.id
+    });
+    
+    console.log(`📞 [WebRTC] Answer sent from ${socket.id} to ${targetSocketId}`);
+  });
+  
+  // ── WebRTC signaling: ICE candidate ──
+  socket.on('webrtc_ice_candidate', (data) => {
+    const { candidate, targetSocketId } = data;
+    
+    if (!videoCallPairs.has(socket.id) || videoCallPairs.get(socket.id) !== targetSocketId) {
+      console.error('[WebRTC] Invalid ICE candidate - not paired');
+      return;
+    }
+    
+    io.to(targetSocketId).emit('webrtc_ice_candidate', {
+      candidate,
+      fromSocketId: socket.id
+    });
+    
+    console.log(`🧊 [WebRTC] ICE candidate sent from ${socket.id} to ${targetSocketId}`);
+  });
+  
+  // ── video_call_next: Skip to next random match ──
+  socket.on('video_call_next', async (data) => {
+    const userId = socket.userId;
+    
+    // End current call if exists
+    if (videoCallPairs.has(socket.id)) {
+      const partnerId = videoCallPairs.get(socket.id);
+      io.to(partnerId).emit('video_call_ended', { reason: 'partner_skipped' });
+      videoCallPairs.delete(partnerId);
+      videoCallPairs.delete(socket.id);
+      console.log(`⏭️ [VideoMatch] ${userId} skipped to next`);
+    }
+    
+    // End call notification
+    socket.emit('video_call_ended', { reason: 'looking_for_next' });
+    
+    // Automatically search for next match (gender will be fetched from Firebase)
+    setTimeout(() => {
+      startVideoMatchForSocket(socket).catch((error) => {
+        console.error('[VideoMatch] Error finding next match:', error);
+        socket.emit('video_match_error', { error: 'Failed to find next match' });
+      });
+    }, 500);
+  });
+  
+  // ── video_call_end: End current call ──
+  socket.on('video_call_end', () => {
+    if (videoCallPairs.has(socket.id)) {
+      const partnerId = videoCallPairs.get(socket.id);
+      io.to(partnerId).emit('video_call_ended', { reason: 'partner_ended' });
+      videoCallPairs.delete(partnerId);
+      videoCallPairs.delete(socket.id);
+      socket.emit('video_call_ended', { reason: 'ended' });
+      console.log(`📴 [VideoMatch] ${socket.userId} ended video call`);
+    }
+  });
+  
+});
+
+// Bind on 0.0.0.0 so physical devices on the same WiFi can connect
+httpServer.listen(PORT, '0.0.0.0', () => {
+  const os = require('os');
+  const nets = os.networkInterfaces();
+  const localIPs = [];
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name]) {
+      if (net.family === 'IPv4' && !net.internal) {
+        localIPs.push(`  📱 Physical device URL: http://${net.address}:${PORT}`);
+      }
+    }
+  }
+  console.log(`🚀 Server running on port ${PORT} (all interfaces)`);
+  console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🔥 Firebase project: ${serviceAccount.project_id}`);
+  console.log(`🔌 Socket.IO ready`);
+  console.log(`  💻 Emulator URL:  http://10.0.2.2:${PORT}`);
+  localIPs.forEach(l => console.log(l));
+  console.log(`  ℹ️  Update _localPcIp in lib/config/app_config.dart with the 📱 URL above`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM signal received: closing HTTP server');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT signal received: closing HTTP server');
+  process.exit(0);
+});
