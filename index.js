@@ -921,14 +921,41 @@ const onlineUsers = new Map();
 // Token can come from auth object (preferred) or query string (fallback)
 io.use(async (socket, next) => {
   try {
-    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
-    if (!token) return next(new Error('No token provided'));
-    const decoded = await admin.auth().verifyIdToken(token);
+    const authHeader = socket.handshake.headers?.authorization || socket.handshake.headers?.Authorization;
+    const headerToken = typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : null;
+
+    const token = socket.handshake.auth?.token || socket.handshake.query?.token || headerToken;
+    console.log(`🔐 [Socket.IO] Auth attempt - Token present: ${!!token}, From: ${token ? (token.length > 20 ? 'auth object' : 'query string') : 'none'}`);
+    
+    if (!token) {
+      console.error('❌ [Socket.IO] No token provided in auth/query/header');
+      return next(new Error('No token provided'));
+    }
+
+    // DEBUG mode: allow connections without real Firebase verification
+    if (process.env.DEBUG_SOCKET_AUTH === 'true') {
+      console.warn('⚠️  DEBUG_SOCKET_AUTH enabled - bypassing Firebase token verification');
+      socket.userId = socket.handshake.query?.userId || 'debug-user-' + Math.random().toString(36).slice(7);
+      socket.userIdFromQuery = socket.handshake.query?.userId || socket.userId;
+      return next();
+    }
+
+    // Verify token with timeout (max 5 seconds to prevent hanging)
+    const verifyPromise = admin.auth().verifyIdToken(token);
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Token verification timeout')), 5000)
+    );
+
+    const decoded = await Promise.race([verifyPromise, timeoutPromise]);
     socket.userId = decoded.uid;
     socket.userIdFromQuery = socket.handshake.query?.userId || decoded.uid;
+    console.log(`✅ [Socket.IO] Token verified for user: ${socket.userId}`);
     next();
   } catch (err) {
-    next(new Error('Invalid or expired token'));
+    console.error('❌ [Socket.IO] Auth middleware failed:', err.message);
+    next(new Error('Invalid or expired token: ' + err.message));
   }
 });
 
