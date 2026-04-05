@@ -312,6 +312,83 @@ app.get('/health', (req, res) => {
   });
 });
 
+// ==================== FIRESTORE DIAGNOSTICS ====================
+
+/**
+ * Test Firestore connection and permissions
+ * No auth required - helps diagnose connection issues
+ */
+app.get('/api/firestore-test', async (req, res) => {
+  try {
+    console.log('\n🧪 ===== FIRESTORE DIAGNOSTICS TEST =====');
+    
+    // Test 1: Check if db is initialized
+    console.log('✓ Step 1: Check Firestore initialization');
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        message: 'Firestore not initialized',
+        steps: {
+          step1: { status: 'FAILED', message: 'db object is null' }
+        }
+      });
+    }
+    console.log('  ✅ Firestore initialized');
+
+    // Test 2: Try a simple query
+    console.log('✓ Step 2: Attempt a test collection query');
+    const testCollection = await db.collection('_firestore_config').limit(1).get();
+    console.log(`  ✅ Query succeeded. Collection exists: ${!testCollection.empty}`);
+
+    // Test 3: Check project ID
+    console.log('✓ Step 3: Verify project configuration');
+    const projectId = serviceAccount.project_id;
+    console.log(`  ✅ Project ID from serviceAccount: ${projectId}`);
+
+    // Test 4: Try to read from 'users' collection
+    console.log('✓ Step 4: Test users collection access');
+    const usersSnap = await db.collection('users').limit(1).get();
+    console.log(`  ✅ Users collection accessible. Exists: ${!usersSnap.empty}`);
+    if (!usersSnap.empty) {
+      console.log(`  📄 Sample document found: ${usersSnap.docs[0].id}`);
+    }
+
+    res.json({
+      success: true,
+      message: 'Firestore is working correctly',
+      diagnostics: {
+        firestoreInitialized: true,
+        projectId: projectId,
+        collectionsAccessible: {
+          '_firestore_config': !testCollection.empty,
+          'users': !usersSnap.empty
+        },
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('❌ Firestore test failed:', error.message);
+    console.error('   Error code:', error.code);
+    console.error('   Full error:', error);
+
+    res.status(500).json({
+      success: false,
+      message: 'Firestore diagnostic test failed',
+      error: {
+        code: error.code,
+        message: error.message,
+        details: error.details || 'No additional details'
+      },
+      troubleshooting: {
+        'UNAUTHENTICATED': 'Check if Firestore API is enabled in Google Cloud Console and if service account has permissions',
+        'PERMISSION_DENIED': 'Service account lacks Firestore read/write permissions. Check Cloud IAM roles',
+        'NOT_FOUND': 'Firestore database not found. Check if Firestore is initialized in Firebase Console',
+        'INVALID_ARGUMENT': 'Check collection and document names for special characters'
+      }
+    });
+  }
+});
+
 // ==================== WEB APP VERIFICATION ====================
 
 /**
@@ -392,24 +469,96 @@ app.get('/api/verify-account', verifyToken, async (req, res) => {
 app.get('/api/users/:userId', verifyToken, async (req, res) => {
   try {
     const { userId } = req.params;
+    const requestingUserId = req.user.uid;
 
-    // Get user from Firestore
-    const userDoc = await db.collection('users').doc(userId).get();
+    console.log(`\n📋 ===== GET USER PROFILE =====`);
+    console.log(`   Requesting user: ${requestingUserId}`);
+    console.log(`   Target user: ${userId}`);
+
+    // Validate userId format
+    if (!userId || userId.length === 0) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid user ID',
+        message: 'User ID cannot be empty'
+      });
+    }
+
+    // Verify Firestore is initialized
+    if (!db) {
+      console.error('❌ Firestore not initialized');
+      return res.status(500).json({
+        success: false,
+        error: 'Database initialization failed',
+        message: 'Firestore database not initialized. Check Firebase Admin SDK setup.'
+      });
+    }
+
+    console.log(`🔍 Querying Firestore: users/${userId}`);
+    
+    // Get user from Firestore with error handling
+    let userDoc;
+    try {
+      userDoc = await db.collection('users').doc(userId).get();
+    } catch (firestoreError) {
+      console.error('❌ Firestore query failed:', firestoreError.message);
+      console.error('   Error code:', firestoreError.code);
+      
+      // Provide detailed error response
+      if (firestoreError.code === 'UNAUTHENTICATED') {
+        return res.status(500).json({
+          success: false,
+          error: 'Firestore authentication failed',
+          message: 'Admin SDK cannot authenticate with Firestore. Check serviceAccountKey.json and IAM permissions.',
+          details: {
+            code: firestoreError.code,
+            suggestion: 'Verify that: 1) Firestore API is enabled in Google Cloud Console, 2) Service account has Editor role, 3) Project ID matches in serviceAccountKey.json'
+          }
+        });
+      } else if (firestoreError.code === 'PERMISSION_DENIED') {
+        return res.status(403).json({
+          success: false,
+          error: 'Permission denied',
+          message: 'Service account lacks permission to read this collection.',
+          details: {
+            code: firestoreError.code,
+            suggestion: 'Ensure service account has "Editor" or "Cloud Datastore Owner" role in Firebase Console.'
+          }
+        });
+      }
+      
+      throw firestoreError; // Re-throw for generic error handler
+    }
 
     if (!userDoc.exists) {
-      return res.status(404).json({ error: 'User not found' });
+      console.log(`⚠️  User document not found: ${userId}`);
+      return res.status(404).json({ 
+        success: false,
+        error: 'User not found',
+        message: `User profile not found for ID: ${userId}`
+      });
     }
+
+    const userData = userDoc.data();
+    console.log(`✅ User found: ${userData.displayName || 'Unknown'}`);
 
     res.json({
       success: true,
       data: {
         id: userDoc.id,
-        ...userDoc.data()
+        ...userData
       }
     });
   } catch (error) {
-    console.error('Error fetching user:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('❌ Error in GET /api/users/:userId:', error.message);
+    console.error('   Full error:', error);
+    
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error.message,
+      code: error.code || 'UNKNOWN'
+    });
   }
 });
 
@@ -418,25 +567,80 @@ app.put('/api/users/:userId', verifyToken, async (req, res) => {
   try {
     const { userId } = req.params;
     const updates = req.body;
+    const requestingUserId = req.user.uid;
+
+    console.log(`\n✏️  ===== UPDATE USER PROFILE =====`);
+    console.log(`   Requesting user: ${requestingUserId}`);
+    console.log(`   Target user: ${userId}`);
+    console.log(`   Fields to update:`, Object.keys(updates));
 
     // Verify user is updating their own profile
-    if (req.user.uid !== userId) {
-      return res.status(403).json({ error: 'Unauthorized' });
+    if (requestingUserId !== userId) {
+      console.log(`⚠️  Authorization check failed: ${requestingUserId} != ${userId}`);
+      return res.status(403).json({ 
+        success: false,
+        error: 'Unauthorized',
+        message: 'You can only update your own profile'
+      });
     }
 
-    // Update Firestore
-    await db.collection('users').doc(userId).update({
-      ...updates,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
+    // Validate updates object
+    if (!updates || Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid request',
+        message: 'No fields provided for update'
+      });
+    }
 
+    // Prevent updating sensitive fields
+    const protectedFields = ['uid', 'createdAt', 'id'];
+    const fieldsToUpdate = { ...updates };
+    protectedFields.forEach(field => delete fieldsToUpdate[field]);
+
+    console.log(`✏️  Writing to Firestore: users/${userId}`);
+
+    try {
+      await db.collection('users').doc(userId).update({
+        ...fieldsToUpdate,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } catch (firestoreError) {
+      console.error('❌ Firestore update failed:', firestoreError.message);
+      console.error('   Error code:', firestoreError.code);
+      
+      if (firestoreError.code === 'NOT_FOUND') {
+        return res.status(404).json({
+          success: false,
+          error: 'User not found',
+          message: `User profile does not exist for ID: ${userId}`
+        });
+      } else if (firestoreError.code === 'UNAUTHENTICATED') {
+        return res.status(500).json({
+          success: false,
+          error: 'Firestore authentication failed',
+          message: 'Admin SDK cannot authenticate with Firestore.',
+          details: { code: firestoreError.code }
+        });
+      }
+      
+      throw firestoreError;
+    }
+
+    console.log(`✅ User profile updated successfully`);
     res.json({
       success: true,
       message: 'User profile updated successfully'
     });
   } catch (error) {
-    console.error('Error updating user:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('❌ Error in PUT /api/users/:userId:', error.message);
+    
+    res.status(500).json({ 
+      success: false,
+      error: 'Internal server error',
+      message: error.message,
+      code: error.code || 'UNKNOWN'
+    });
   }
 });
 
