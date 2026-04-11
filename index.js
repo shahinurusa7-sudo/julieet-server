@@ -12,6 +12,7 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const bodyParser = require('body-parser');
 const rateLimit = require('express-rate-limit');
+const nodemailer = require('nodemailer');
 const PendingMessage = require('./models/PendingMessage');
 const packageJson = require('./package.json');
 
@@ -99,6 +100,262 @@ const db = admin.firestore();
 const realtimeDb = admin.database();
 const auth = admin.auth();
 const storage = admin.storage();
+
+const SMTP_HOST = process.env.SMTP_HOST || '';
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
+const SMTP_SECURE = String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true';
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASS = process.env.SMTP_PASS || '';
+const SMTP_FROM_EMAIL = process.env.SMTP_FROM_EMAIL || SMTP_USER;
+const SMTP_FROM_NAME = process.env.SMTP_FROM_NAME || 'Julieet Team';
+const SMTP_REPLY_TO = process.env.SMTP_REPLY_TO || SMTP_FROM_EMAIL;
+const COMPANY_NAME = process.env.COMPANY_NAME || 'Julieet';
+const CEO_NAME = process.env.CEO_NAME || 'Shahinur Alam';
+const CEO_TITLE = process.env.CEO_TITLE || 'Chief Executive Officer';
+const APP_LOGIN_URL = process.env.APP_LOGIN_URL || 'https://julieet.com';
+const WELCOME_EMAIL_ENABLED =
+  String(process.env.WELCOME_EMAIL_ENABLED || 'true').toLowerCase() === 'true';
+
+const smtpConfigured =
+  SMTP_HOST.length > 0 &&
+  Number.isFinite(SMTP_PORT) &&
+  SMTP_PORT > 0 &&
+  SMTP_USER.length > 0 &&
+  SMTP_PASS.length > 0 &&
+  SMTP_FROM_EMAIL.length > 0;
+
+const smtpTransporter = smtpConfigured
+  ? nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_SECURE,
+      auth: {
+        user: SMTP_USER,
+        pass: SMTP_PASS,
+      },
+    })
+  : null;
+
+if (WELCOME_EMAIL_ENABLED) {
+  if (smtpConfigured) {
+    console.log(`📧 SMTP welcome email enabled (${SMTP_HOST}:${SMTP_PORT})`);
+  } else {
+    console.warn('⚠️ WELCOME_EMAIL_ENABLED=true but SMTP is not fully configured. Welcome emails will be skipped.');
+  }
+}
+
+const escapeHtml = (value) => String(value || '')
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;');
+
+const getDisplayNameFromUserData = (data, fallbackEmail = '') => {
+  const candidates = [
+    data?.displayName,
+    data?.name,
+    data?.username,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+
+  if (typeof fallbackEmail === 'string' && fallbackEmail.includes('@')) {
+    return fallbackEmail.split('@')[0];
+  }
+
+  return 'there';
+};
+
+const getWelcomeRecipientName = async ({ userId, email, firestoreData }) => {
+  const candidateNames = [];
+
+  try {
+    const userRecord = await auth.getUser(userId);
+    candidateNames.push(userRecord.displayName);
+    candidateNames.push(userRecord.email);
+  } catch (error) {
+    console.warn(`⚠️ Could not read Firebase Auth user ${userId}: ${error.message}`);
+  }
+
+  candidateNames.push(
+    firestoreData?.displayName,
+    firestoreData?.name,
+    firestoreData?.username,
+  );
+
+  for (const candidate of candidateNames) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+
+  if (typeof email === 'string' && email.includes('@')) {
+    return email.split('@')[0];
+  }
+
+  return 'there';
+};
+
+const buildWelcomeEmail = ({ userName }) => {
+  const safeName = escapeHtml(userName || 'there');
+  const safeCompany = escapeHtml(COMPANY_NAME);
+  const safeCeoName = escapeHtml(CEO_NAME);
+  const safeCeoTitle = escapeHtml(CEO_TITLE);
+  const safeLoginUrl = escapeHtml(APP_LOGIN_URL);
+
+  const subject = `Welcome to ${COMPANY_NAME}, ${userName || 'friend'}!`;
+
+  const html = `
+  <div style="background:#f3f6fb;padding:28px 12px;font-family:Segoe UI,Arial,sans-serif;color:#1e293b;">
+    <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #dbe3ef;">
+      <div style="padding:28px 30px;background:linear-gradient(120deg,#0f766e,#0f172a);color:#ffffff;">
+        <h1 style="margin:0;font-size:24px;line-height:1.2;">Welcome to ${safeCompany}</h1>
+        <p style="margin:10px 0 0 0;font-size:14px;opacity:.92;">We are delighted to have you with us.</p>
+      </div>
+      <div style="padding:28px 30px;">
+        <p style="margin:0 0 14px 0;font-size:16px;">Dear ${safeName},</p>
+        <p style="margin:0 0 14px 0;font-size:15px;line-height:1.7;">
+          Thank you for joining ${safeCompany}. Your account is now active and ready.
+          We built this platform to help you connect meaningfully, safely, and confidently.
+        </p>
+        <p style="margin:0 0 18px 0;font-size:15px;line-height:1.7;">
+          If you need any assistance, our team is here to support you.
+        </p>
+        <a href="${safeLoginUrl}" style="display:inline-block;background:#0f766e;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:8px;font-weight:600;font-size:14px;">Open ${safeCompany}</a>
+        <div style="margin-top:24px;padding-top:18px;border-top:1px solid #e2e8f0;">
+          <p style="margin:0 0 6px 0;font-size:15px;">Warm regards,</p>
+          <p style="margin:0;font-size:15px;font-weight:700;">${safeCeoName}</p>
+          <p style="margin:4px 0 0 0;font-size:13px;color:#475569;">${safeCeoTitle}</p>
+          <p style="margin:12px 0 0 0;font-size:13px;color:#475569;">${safeCompany}</p>
+        </div>
+      </div>
+    </div>
+  </div>`;
+
+  const text = [
+    `Welcome to ${COMPANY_NAME}`,
+    '',
+    `Dear ${userName || 'there'},`,
+    '',
+    `Thank you for joining ${COMPANY_NAME}. Your account is now active and ready.`,
+    `Open the app here: ${APP_LOGIN_URL}`,
+    '',
+    'Warm regards,',
+    `${CEO_NAME}`,
+    `${CEO_TITLE}`,
+    `${COMPANY_NAME}`,
+  ].join('\n');
+
+  return { subject, html, text };
+};
+
+const sendWelcomeEmail = async ({ email, userName }) => {
+  if (!WELCOME_EMAIL_ENABLED) {
+    return { sent: false, reason: 'welcome_disabled' };
+  }
+
+  if (!smtpTransporter || !smtpConfigured) {
+    return { sent: false, reason: 'smtp_not_configured' };
+  }
+
+  const target = String(email || '').trim();
+  if (!target) {
+    return { sent: false, reason: 'missing_email' };
+  }
+
+  const content = buildWelcomeEmail({ userName });
+  await smtpTransporter.sendMail({
+    from: `"${SMTP_FROM_NAME}" <${SMTP_FROM_EMAIL}>`,
+    to: target,
+    replyTo: SMTP_REPLY_TO,
+    subject: content.subject,
+    text: content.text,
+    html: content.html,
+  });
+
+  return { sent: true };
+};
+
+const maybeSendWelcomeEmailForUser = async ({ userId, fallbackEmail = '' }) => {
+  if (!WELCOME_EMAIL_ENABLED) {
+    return { status: 'disabled' };
+  }
+
+  const userRef = db.collection('users').doc(userId);
+  let candidate = null;
+  let firestoreData = null;
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    if (!snap.exists) {
+      return;
+    }
+
+    const data = snap.data() || {};
+    firestoreData = data;
+    if (data.welcomeEmailSentAt || data.welcomeEmailLockAt) {
+      return;
+    }
+
+    const email = String(data.email || fallbackEmail || '').trim();
+    if (!email) {
+      return;
+    }
+
+    candidate = {
+      email,
+      userName: getDisplayNameFromUserData(data, email),
+    };
+
+    tx.set(userRef, {
+      welcomeEmailLockAt: admin.firestore.FieldValue.serverTimestamp(),
+      welcomeEmailRecipient: email,
+    }, { merge: true });
+  });
+
+  if (!candidate) {
+    return { status: 'skipped' };
+  }
+
+  try {
+    const userName = await getWelcomeRecipientName({
+      userId,
+      email: candidate.email,
+      firestoreData,
+    });
+
+    const result = await sendWelcomeEmail({
+      email: candidate.email,
+      userName,
+    });
+    if (result.sent) {
+      await userRef.set({
+        welcomeEmailSentAt: admin.firestore.FieldValue.serverTimestamp(),
+        welcomeEmailError: admin.firestore.FieldValue.delete(),
+        welcomeEmailLockAt: admin.firestore.FieldValue.delete(),
+      }, { merge: true });
+      return { status: 'sent' };
+    }
+
+    await userRef.set({
+      welcomeEmailError: result.reason || 'unknown',
+      welcomeEmailLockAt: admin.firestore.FieldValue.delete(),
+    }, { merge: true });
+    return { status: 'failed', reason: result.reason || 'unknown' };
+  } catch (error) {
+    await userRef.set({
+      welcomeEmailError: error.message,
+      welcomeEmailLockAt: admin.firestore.FieldValue.delete(),
+    }, { merge: true });
+
+    return { status: 'failed', reason: error.message };
+  }
+};
 
 const safeDecodeURIComponent = (value) => {
   try {
@@ -200,6 +457,49 @@ const serializePendingMessageForClient = (msg) => ({
   metadata: msg.metadata || {}
 });
 
+const sendNewMessagePushNotification = async ({
+  receiverId,
+  senderId,
+  chatId,
+  messageId,
+  messageType,
+  content,
+}) => {
+  if (!receiverId) return false;
+
+  try {
+    const receiverDoc = await db.collection('users').doc(receiverId).get();
+    if (!receiverDoc.exists) {
+      return false;
+    }
+
+    const receiverData = receiverDoc.data() || {};
+    const fcmToken = receiverData.fcmToken;
+    if (!fcmToken) {
+      return false;
+    }
+
+    await admin.messaging().send({
+      notification: {
+        title: 'New Message',
+        body: messageType === 'text' ? String(content || '') : `Sent a ${messageType || 'message'}`,
+      },
+      data: {
+        type: 'new_message',
+        chatId: String(chatId || ''),
+        messageId: String(messageId || ''),
+        senderId: String(senderId || ''),
+      },
+      token: fcmToken,
+    });
+
+    return true;
+  } catch (error) {
+    console.warn('Failed to send push notification:', error.message);
+    return false;
+  }
+};
+
 const normalizeMongoUri = (uri) => {
   if (!uri) {
     return uri;
@@ -234,15 +534,23 @@ const normalizeMongoUri = (uri) => {
   return `${prefix}${username}:${encodedPassword}@${hostAndQuery}`;
 };
 
-// Initialize MongoDB connection
-const connectMongoDB = async () => {
+// Initialize MongoDB connection with retry logic
+const connectMongoDB = async (attempt = 1, maxAttempts = 3) => {
   try {
     const configuredMongoUri = process.env.MONGODB_URI || 'mongodb+srv://doadmin:8R67T5uh2V9M13dj@dbaas-db-8716287-669712ac.mongo.ondigitalocean.com/admin?tls=true&authSource=admin&replicaSet=dbaas-db-8716287';
     const mongoUri = normalizeMongoUri(configuredMongoUri);
 
+    console.log(`🔄 MongoDB connection attempt ${attempt}/${maxAttempts}...`);
+    
     await mongoose.connect(mongoUri, {
-      serverSelectionTimeoutMS: 15000
+      serverSelectionTimeoutMS: 30000, // Increased from 15s to 30s
+      socketTimeoutMS: 45000,
+      family: 4, // Use IPv4 if available
+      retryWrites: true,
+      maxPoolSize: 10,
+      minPoolSize: 2,
     });
+    
     console.log('✅ MongoDB connected successfully');
     console.log(`📦 Temporary SMS/message storage active in MongoDB: ${maskMongoUri(mongoUri)}`);
 
@@ -257,8 +565,25 @@ const connectMongoDB = async () => {
     }, 24 * 60 * 60 * 1000); // Run every 24 hours
 
   } catch (error) {
-    console.error('❌ MongoDB connection error:', error.message);
-    console.warn('⚠️  Server running without MongoDB. Message queue features disabled.');
+    console.error(`❌ MongoDB connection attempt ${attempt} failed:`, error.message);
+    
+    // Log more diagnostic info
+    if (error.reason) console.error('   Reason:', error.reason);
+    if (error.code) console.error('   Code:', error.code);
+    
+    if (attempt < maxAttempts) {
+      const delayMs = Math.min(5000 * attempt, 15000); // Exponential backoff: 5s, 10s, 15s
+      console.log(`⏳ Retrying in ${delayMs / 1000} seconds...`);
+      setTimeout(() => connectMongoDB(attempt + 1, maxAttempts), delayMs);
+    } else {
+      console.warn('⚠️  Could not establish MongoDB connection after several attempts.');
+      console.warn('💡 Troubleshooting tips:');
+      console.warn('   1. Verify the MongoDB URI in .env is correct');
+      console.warn('   2. Check that your server IP is whitelisted in MongoDB Atlas/DigitalOcean');
+      console.warn('   3. Ensure network connectivity to the MongoDB cluster');
+      console.warn('   4. Check MongoDB cluster status at your provider dashboard');
+      console.warn('⚠️  Server running without MongoDB. Message queue features disabled.');
+    }
   }
 };
 
@@ -422,6 +747,20 @@ app.get('/api/verify-account', verifyToken, async (req, res) => {
 
     const userData = userDoc.data();
     console.log(`   User data found:`, JSON.stringify(userData, null, 2));
+
+    // Fire-and-forget welcome email for first-time backend-verified users.
+    maybeSendWelcomeEmailForUser({
+      userId,
+      fallbackEmail: email,
+    }).then((result) => {
+      if (result.status === 'sent') {
+        console.log(`📧 Welcome email sent to ${email} for ${userId}`);
+      } else if (result.status === 'failed') {
+        console.warn(`⚠️ Welcome email failed for ${userId}: ${result.reason}`);
+      }
+    }).catch((e) => {
+      console.warn(`⚠️ Welcome email pipeline error for ${userId}: ${e.message}`);
+    });
 
     // Verify email matches (optional additional check)
     if (userData.email && userData.email !== email) {
@@ -628,9 +967,16 @@ app.put('/api/users/:userId', verifyToken, async (req, res) => {
     }
 
     console.log(`✅ User profile updated successfully`);
+
+    const welcomeResult = await maybeSendWelcomeEmailForUser({
+      userId,
+      fallbackEmail: req.user.email || '',
+    });
+
     res.json({
       success: true,
-      message: 'User profile updated successfully'
+      message: 'User profile updated successfully',
+      welcomeEmail: welcomeResult,
     });
   } catch (error) {
     console.error('❌ Error in PUT /api/users/:userId:', error.message);
@@ -763,30 +1109,15 @@ app.post('/api/messages/send', verifyToken, async (req, res) => {
 
       await pendingMessage.save();
 
-      // Also try to send push notification
-      try {
-        const receiverDoc = await db.collection('users').doc(receiverId).get();
-        if (receiverDoc.exists) {
-          const receiverData = receiverDoc.data();
-          if (receiverData.fcmToken) {
-            await admin.messaging().send({
-              notification: {
-                title: 'New Message',
-                body: messageType === 'text' ? content : `Sent a ${messageType}`
-              },
-              data: {
-                type: 'new_message',
-                chatId,
-                messageId,
-                senderId: req.user.uid
-              },
-              token: receiverData.fcmToken
-            });
-          }
-        }
-      } catch (notifError) {
-        console.warn('Failed to send push notification:', notifError.message);
-      }
+      // Receiver may have internet but app closed/background: notify via FCM.
+      await sendNewMessagePushNotification({
+        receiverId,
+        senderId: req.user.uid,
+        chatId,
+        messageId,
+        messageType: messageType || 'text',
+        content,
+      });
 
       res.json({
         success: true,
@@ -1121,6 +1452,12 @@ const io = new Server(httpServer, {
 // Track online users:  userId -> Set<socketId>
 const onlineUsers = new Map();
 
+const isUserOnline = (uid) => {
+  if (!uid) return false;
+  const sockets = onlineUsers.get(uid);
+  return !!sockets && sockets.size > 0;
+};
+
 // Auth middleware – verify Firebase token on every connection
 // Token can come from auth object (preferred) or query string (fallback)
 io.use(async (socket, next) => {
@@ -1177,13 +1514,21 @@ io.on('connection', (socket) => {
   // Broadcast online status
   socket.broadcast.emit('presence_update', { userId, status: 'online', lastSeen: null });
 
+  // ── get_online_users ───────────────────────────────────────
+  socket.on('get_online_users', () => {
+    const users = Array.from(onlineUsers.entries())
+      .filter(([, sockets]) => sockets && sockets.size > 0)
+      .map(([uid]) => uid);
+    socket.emit('online_users', users);
+  });
+
   // ── send_message ────────────────────────────────────────────
   socket.on('send_message', async (data) => {
     try {
       const { messageId, chatId, receiverId, content, mediaUrl, messageType, timestamp } = data;
 
       // Deliver to receiver if online
-      if (onlineUsers.has(receiverId)) {
+      if (isUserOnline(receiverId)) {
         io.to(receiverId).emit('new_message', {
           messageId,
           chatId,
@@ -1218,6 +1563,18 @@ io.on('connection', (socket) => {
               },
             }).save();
           }
+
+          // Receiver is offline in-app: trigger push notification so user sees it
+          // even when app socket is disconnected.
+          await sendNewMessagePushNotification({
+            receiverId,
+            senderId: userId,
+            chatId,
+            messageId,
+            messageType: messageType || 'text',
+            content,
+          });
+
           socket.emit('message_status_update', { messageId, status: 'pending' });
           console.log(`📦 [Socket.IO] Message ${messageId} queued for offline user ${receiverId}`);
         } catch (dbErr) {
@@ -1232,13 +1589,12 @@ io.on('connection', (socket) => {
   // ── fetch_pending – deliver queued messages on reconnect ────
   socket.on('fetch_pending', async (data) => {
     try {
-      const lastSyncTime = data?.lastSyncTime || 0;
-      const since = new Date(lastSyncTime);
+      // Always fetch all still-pending messages for this user.
+      // Filtering by client sync time can accidentally skip queued offline items.
       const pending = await PendingMessage.find({
         receiverId: userId,
         status: 'pending',
-        createdAt: { $gte: since },
-      }).sort({ createdAt: 1 }).limit(100);
+      }).sort({ createdAt: 1 }).limit(200);
 
       if (pending.length > 0) {
         socket.emit('pending_messages', pending.map(m => ({
@@ -1259,21 +1615,63 @@ io.on('connection', (socket) => {
 
   // ── ack – mark message as delivered ────────────────────────
   socket.on('ack', async (data) => {
-    const { messageId, ackType } = data;
+    const { messageId, ackType, senderId } = data;
     if (ackType === 'delivered') {
       try {
-        await PendingMessage.findOneAndUpdate(
-          { messageId, receiverId: userId },
-          { $set: { status: 'delivered', deliveredAt: new Date() } },
-        );
+        // Receiver came online and confirmed delivery:
+        // remove from temporary queue and notify original sender.
+        const deliveredMsg = await PendingMessage.findOneAndDelete({
+          messageId,
+          receiverId: userId,
+        });
+
+        const originalSenderId = deliveredMsg?.senderId || senderId;
+        if (originalSenderId) {
+          io.to(originalSenderId).emit('message_status_update', {
+            messageId,
+            status: 'delivered',
+            deliveredTo: userId,
+            timestamp: Date.now(),
+          });
+          io.to(originalSenderId).emit('message_delivered', {
+            messageId,
+            receiverId: userId,
+            timestamp: Date.now(),
+          });
+        }
       } catch (e) { /* non-critical */ }
+    }
+  });
+
+  // Backward-compatible explicit delivered event from some clients.
+  socket.on('message_delivered', async (data) => {
+    try {
+      const { messageId, senderId } = data || {};
+      if (!messageId) return;
+
+      const deliveredMsg = await PendingMessage.findOneAndDelete({
+        messageId,
+        receiverId: userId,
+      });
+
+      const originalSenderId = deliveredMsg?.senderId || senderId;
+      if (originalSenderId) {
+        io.to(originalSenderId).emit('message_status_update', {
+          messageId,
+          status: 'delivered',
+          deliveredTo: userId,
+          timestamp: Date.now(),
+        });
+      }
+    } catch (e) {
+      console.error('[Socket.IO] message_delivered error:', e);
     }
   });
 
   // ── typing indicator ────────────────────────────────────────
   socket.on('typing', (data) => {
     const { receiverId, chatId, isTyping } = data;
-    if (receiverId && onlineUsers.has(receiverId)) {
+    if (receiverId && isUserOnline(receiverId)) {
       io.to(receiverId).emit('typing_status', {
         senderId: userId,
         chatId,
@@ -1284,9 +1682,13 @@ io.on('connection', (socket) => {
 
   // ── mark_seen ───────────────────────────────────────────────
   socket.on('mark_seen', (data) => {
-    const { chatId, senderId: originalSender } = data;
+    const { chatId, senderId: originalSender, messageId } = data;
     if (originalSender && onlineUsers.has(originalSender)) {
-      io.to(originalSender).emit('message_seen', { chatId, seenBy: userId });
+      io.to(originalSender).emit('message_seen', {
+        chatId,
+        messageId,
+        seenBy: userId,
+      });
     }
   });
 
@@ -1306,12 +1708,10 @@ io.on('connection', (socket) => {
     }
     
     // Handle video call disconnection
-    if (videoCallPairs.has(socket.id)) {
-      const partnerId = videoCallPairs.get(socket.id);
-      io.to(partnerId).emit('video_call_ended', { reason: 'partner_disconnected' });
-      videoCallPairs.delete(partnerId);
-      videoCallPairs.delete(socket.id);
-    }
+    terminateVideoPair(socket, {
+      partnerReason: 'partner_disconnected',
+      emitSelf: false,
+    });
     
     // Remove from waiting queues
     maleQueue.delete(socket.id);
@@ -1339,6 +1739,34 @@ const ICE_SERVERS = [
 const removeSocketFromVideoQueues = (socketId) => {
   maleQueue.delete(socketId);
   femaleQueue.delete(socketId);
+};
+
+const terminateVideoPair = (
+  socket,
+  {
+    partnerReason = 'partner_ended',
+    selfReason = 'ended',
+    emitSelf = true,
+  } = {},
+) => {
+  const socketId = socket.id;
+  if (!videoCallPairs.has(socketId)) {
+    return null;
+  }
+
+  const partnerSocketId = videoCallPairs.get(socketId);
+  videoCallPairs.delete(socketId);
+
+  if (partnerSocketId) {
+    videoCallPairs.delete(partnerSocketId);
+    io.to(partnerSocketId).emit('video_call_ended', { reason: partnerReason });
+  }
+
+  if (emitSelf) {
+    socket.emit('video_call_ended', { reason: selfReason });
+  }
+
+  return partnerSocketId;
 };
 
 const findNextValidPartner = (oppositeQueue, currentSocketId) => {
@@ -1457,6 +1885,12 @@ io.on('connection', (socket) => {
   // ── video_match_start: Join queue for random video matching ──
   socket.on('video_match_start', async () => {
     try {
+      // If already paired, end current call before entering queue again.
+      terminateVideoPair(socket, {
+        partnerReason: 'partner_left_for_new_match',
+        selfReason: 'restarting_match',
+      });
+
       await startVideoMatchForSocket(socket);
     } catch (error) {
       console.error('[VideoMatch] Error in video_match_start:', error);
@@ -1467,6 +1901,10 @@ io.on('connection', (socket) => {
   // ── video_match_cancel: Leave the matching queue ──
   socket.on('video_match_cancel', () => {
     const userId = socket.userId;
+    terminateVideoPair(socket, {
+      partnerReason: 'partner_cancelled_matching',
+      selfReason: 'cancelled',
+    });
     removeSocketFromVideoQueues(socket.id);
     socket.emit('video_match_cancelled', { message: 'Matching cancelled' });
     console.log(`❌ [VideoMatch] ${userId} cancelled matching`);
@@ -1528,11 +1966,10 @@ io.on('connection', (socket) => {
     const userId = socket.userId;
     
     // End current call if exists
-    if (videoCallPairs.has(socket.id)) {
-      const partnerId = videoCallPairs.get(socket.id);
-      io.to(partnerId).emit('video_call_ended', { reason: 'partner_skipped' });
-      videoCallPairs.delete(partnerId);
-      videoCallPairs.delete(socket.id);
+    if (terminateVideoPair(socket, {
+      partnerReason: 'partner_skipped',
+      emitSelf: false,
+    })) {
       console.log(`⏭️ [VideoMatch] ${userId} skipped to next`);
     }
     
@@ -1550,12 +1987,10 @@ io.on('connection', (socket) => {
   
   // ── video_call_end: End current call ──
   socket.on('video_call_end', () => {
-    if (videoCallPairs.has(socket.id)) {
-      const partnerId = videoCallPairs.get(socket.id);
-      io.to(partnerId).emit('video_call_ended', { reason: 'partner_ended' });
-      videoCallPairs.delete(partnerId);
-      videoCallPairs.delete(socket.id);
-      socket.emit('video_call_ended', { reason: 'ended' });
+    if (terminateVideoPair(socket, {
+      partnerReason: 'partner_ended',
+      selfReason: 'ended',
+    })) {
       console.log(`📴 [VideoMatch] ${socket.userId} ended video call`);
     }
   });
